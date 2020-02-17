@@ -3,7 +3,6 @@ import torch.nn as nn
 import dgl.function as fn
 from dgl.nn.pytorch import edge_softmax, GATConv
 
-
 class GAT(nn.Module):
     def __init__(self,
                  g,
@@ -44,3 +43,35 @@ class GAT(nn.Module):
         # output projection
         logits = self.gat_layers[-1](self.g, h).mean(1)
         return logits
+
+if __name__ == '__main__':
+    import torch.nn.functional as F
+    from torchviz import make_dot
+    from dgl.data.ppi import LegacyPPIDataset
+    from torch.utils.tensorboard import SummaryWriter
+
+    num_layers = 2
+    num_hidden = 256
+    activation = F.elu
+    feat_drop = 0
+    attn_drop = 0
+    negative_slope = 0.2
+    residual = True
+    lr = 0.005
+    weight_decay = 0
+    num_heads = 4
+    num_out_heads = 6
+
+    train_dataset = LegacyPPIDataset(mode="train")
+    in_dim = train_dataset.features.shape[1]
+    num_classes = train_dataset.labels.shape[1]
+    heads = ([num_heads] * num_layers) + [num_out_heads]
+
+    with SummaryWriter('runs') as writer:
+        print('Init model...')
+        model = GAT(train_dataset.graph, num_layers, in_dim, num_hidden, num_classes, heads, activation, feat_drop, attn_drop, negative_slope, residual)
+        print('Done')
+        inputs = torch.randn((44906, 50))
+        logits = model(inputs.float())
+        writer.add_graph(model, inputs.float())
+        # make_dot(logits).render("attached", format="png")

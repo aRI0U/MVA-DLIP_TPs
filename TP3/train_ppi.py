@@ -1,20 +1,23 @@
 import argparse
-from os import path
+import os
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from dgl import batch
 from dgl.data.ppi import LegacyPPIDataset
+import dgl.function as fn
 from dgl.nn.pytorch import GraphConv
+from dgl.nn.pytorch import edge_softmax, GATConv
 from sklearn.metrics import f1_score
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from model import GAT
+from torch.utils.tensorboard import SummaryWriter
+
 import matplotlib.pyplot as plt
 import pickle
 
-MODEL_STATE_FILE = path.join(path.dirname(path.abspath(__file__)), "model_state.pth")
+MODEL_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_state.pth")
 
 num_layers = 2
 
@@ -29,23 +32,46 @@ weight_decay = 0
 num_heads = 4
 num_out_heads = 6
 
-class BasicGraphModel(nn.Module):
-
-    def __init__(self, g, n_layers, input_size, hidden_size, output_size, nonlinearity):
-        super().__init__()
-
+class GAT(nn.Module):
+    def __init__(self,
+                 g,
+                 num_layers,
+                 in_dim,
+                 num_hidden,
+                 num_classes,
+                 heads,
+                 activation,
+                 feat_drop,
+                 attn_drop,
+                 negative_slope,
+                 residual):
+        super(GAT, self).__init__()
         self.g = g
-        self.layers = nn.ModuleList()
-        self.layers.append(GraphConv(input_size, hidden_size, activation=nonlinearity))
-        for i in range(n_layers - 1):
-            self.layers.append(GraphConv(hidden_size, hidden_size, activation=nonlinearity))
-        self.layers.append(GraphConv(hidden_size, output_size))
+        self.num_layers = num_layers
+        self.gat_layers = nn.ModuleList()
+        self.activation = activation
+        # input projection (no residual)
+        self.gat_layers.append(GATConv(
+            in_dim, num_hidden, heads[0],
+            feat_drop, attn_drop, negative_slope, False, self.activation))
+        # hidden layers
+        for l in range(1, num_layers):
+            # due to multi-head, the in_dim = num_hidden * num_heads
+            self.gat_layers.append(GATConv(
+                num_hidden * heads[l-1], num_hidden, heads[l],
+                feat_drop, attn_drop, negative_slope, residual, self.activation))
+        # output projection
+        self.gat_layers.append(GATConv(
+            num_hidden * heads[-2], num_classes, heads[-1],
+            feat_drop, attn_drop, negative_slope, residual, None))
 
     def forward(self, inputs):
-        outputs = inputs
-        for i, layer in enumerate(self.layers):
-            outputs = layer(self.g, outputs)
-        return outputs
+        h = inputs
+        for l in range(self.num_layers):
+            h = self.gat_layers[l](self.g, h).flatten(1)
+        # output projection
+        logits = self.gat_layers[-1](self.g, h).mean(1)
+        return logits
 
 
 def main(args):
@@ -74,24 +100,27 @@ def main(args):
 
 def train(model, loss_fcn, device, optimizer, train_dataloader, test_dataset):
     loss_plot = []
-    for epoch in range(args.epochs):
+    for epoch in range(1, args.epochs+1):
         model.train()
         losses = []
         for batch, data in enumerate(train_dataloader):
             subgraph, features, labels = data
+            print(features, features.shape, features.dtype)
             features = features.to(device)
             labels = labels.to(device)
             model.g = subgraph
             for layer in model.gat_layers:
                 layer.g = subgraph
             logits = model(features.float())
+            # writer.add_graph(model, features.float())
             loss = loss_fcn(logits, labels.float())
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
         loss_data = np.array(losses).mean()
-        print("Epoch {:05d} | Loss: {:.4f}".format(epoch + 1, loss_data))
+        writer.add_scalar('Training loss', loss_data, epoch)
+        print("Epoch {:d} | Loss: {:.4f}".format(epoch, loss_data))
 
         if epoch % 5 == 0:
             scores = []
@@ -101,9 +130,11 @@ def train(model, loss_fcn, device, optimizer, train_dataloader, test_dataset):
                 labels = torch.tensor(labels).to(device)
                 score, _ = evaluate(features.float(), model, subgraph, labels.float(), loss_fcn)
                 scores.append(score)
-            print("F1-Score: {:.4f} ".format(np.array(scores).mean()))
-            loss_plot.append(np.array(scores).mean())
-    with open("loss.txt", "wb") as fp:
+            scores_mean = np.array(scores).mean()
+            print("F1-Score: {:.4f} ".format(scores_mean))
+            loss_plot.append(scores_mean)
+            writer.add_scalar('F1-score', scores_mean, epoch)
+    with open("loss", "wb") as fp:
         pickle.dump(loss_plot, fp)
     plt.plot(np.arange(0,args.epochs,step = 5),loss_plot)
     plt.show()
@@ -146,8 +177,18 @@ def collate_fn(sample):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode",  choices=["train", "test"], default="train")
-    parser.add_argument("--gpu", type=int, default=0, help="GPU to use. Set -1 to use CPU.")
+    parser.add_argument("--gpu", type=int, default=-1, help="GPU to use. Set -1 to use CPU.")
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--name", type=str, default=None)
     args = parser.parse_args()
-    main(args)
+
+    if args.name is None:
+        from datetime import datetime
+        args.name = datetime.now().strftime("%Y-%m-%d_%H:%M")
+
+    args.name = os.path.join("runs", args.name)
+    os.makedirs(args.name, exist_ok=True)
+    # writer = SummaryWriter(args.name)
+    with SummaryWriter(args.name) as writer:
+        main(args)
